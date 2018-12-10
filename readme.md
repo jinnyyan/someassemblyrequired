@@ -108,7 +108,7 @@ Knowing that `arg#0` points to the starting location of the 256-byte second-leve
 
 So, all of the parameters and local variables are not helpfully named. This makes sense since WebAssembly is essentially a chain of pushing and popping local variables onto and from the stack. I realized that reversing this by translating its logic by hand was probably beyond my ability to do in a timely fashion, so I turned to alternative methods.
 
-I realized that since I knew that `_crypt1` was a pure function (i.e., its output relies solely on the parameters passed to it and not on any other system state), I could "cheat" a little bit by shimming the WebAssembly linear memory within a Python script and allow the routine (mainly unchanged) to act on that shimmed memory (consequently writing its result to a known location where I could read it).
+Since I knew that `_crypt1` was a pure function (i.e., its output relies solely on the parameters passed to it and not on any other system state), I could "cheat" a little bit by shimming the WebAssembly linear memory within a Python script and allow the routine (mainly unchanged) to act on that shimmed memory (consequently writing its result to a known location where I could read it).
 
 Using this method, all I had to do was make a few syntactic changes to the disassembled C code and replace the WebAssembly memory loading and storing instructions with reads and writes to my shimmed memory object (which was just a Python list of integers). The resultant reversal of this encryption was a simple command-line Python application, found in the [`crypt1_reversed.py`](./crypt1_reversed.py) file in this repository.
 
