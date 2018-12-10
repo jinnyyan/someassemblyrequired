@@ -53,7 +53,9 @@ Knowing that the mining client was both sending and receiving some type of encry
 * Further obfuscate this key via the `_crypt1_ks` routine
 * Run the actual encryption routine using this obfuscated key, done in the `_crypt1` routine
 
-I was able to determine this chain events from some analysis of the first message that the miner sends to the C2 server which, when decrypted, is the plaintext string `hello`. This ended up being something very important to find, as the address in memory of the `hello` string was statically defined to `5620`, meaning that I knew the memory location of a string that would always be sent to the C2 server on program startup. This meant that I could pause execution, overwrite this address with a string of my choosing, and resume execution to send any encrypted message I wanted to the C2 server. While I could have used this mechanism to completely bypass the reversal of `crypt1`, it was a fairly timely process. If I was going to be searching for vulnerabilities in the C2 server, I would need something quick and dirty like a Python script (which would require actually reversing the encryption). However, this overwrite at memory location `5620` will be an important piece later on. This is will be an important piece later on. The encrypted `hello` message being sent is shown in the below screenshot on Chrome's networking tools.
+I was able to determine this chain events from some analysis of the first message that the miner sends to the C2 server which, when decrypted, is the plaintext string `hello`. This ended up being something very important to find, as the address in memory of the `hello` string was statically defined to `5620`, meaning that I knew the memory location of a string that would always be sent to the C2 server on program startup. This meant that I could pause execution, overwrite this address with a string of my choosing, and resume execution to send any encrypted message I wanted to the C2 server.
+
+While I could have used this mechanism to completely bypass the reversal of `crypt1`, each iteration was a fairly timely process. If I was going to be searching for vulnerabilities in the C2 server, I would need something quick and dirty like a Python script (which would require actually reversing the encryption). However, this overwrite at memory location `5620` will be an important piece later on. This is will be an important piece later on. The encrypted `hello` message being sent is shown in the below screenshot on Chrome's networking tools.
 
 ![encrypted hello message](./img/crypt1/network_send_encrypted_hello.png "encrypted hello message")
 
@@ -93,13 +95,45 @@ Of note is that I was able to pull the full 256-byte second-level from memory. B
 
 ![crypt1 C code](./img/crypt1/c_code.png "crypt1 C code")
 
-So, all of the parameters and local variables are not helpfully named. I realized that reversing this by translating its logic by hand was probably beyond my ability to do in a timely fashion, so I turned to alternative methods. I realized that since I knew that `_crypt1` was a pure function (i.e., its output relies solely on the parameters passed to it and not on any other system state), I could "cheat" a little bit by shimming the WebAssembly linear memory within a Python script and allow the routine (mainly unchanged) to act on that shimmed memory instead. Using this method, all I had to do was make a few syntactic changes to the disassembled C code and replace the WebAssembly memory loading and storing instructions with reads and writes to my shimmed memory object (which was just a Python list of integers). The resultant reversal of this encryption was a simple command-line Python application, found in the [`crypt1_reversed.py`](./crypt1_reversed.py) file in this repository.
+So, all of the parameters and local variables are not helpfully named. I realized that reversing this by translating its logic by hand was probably beyond my ability to do in a timely fashion, so I turned to alternative methods. I realized that since I knew that `_crypt1` was a pure function (i.e., its output relies solely on the parameters passed to it and not on any other system state), I could "cheat" a little bit by shimming the WebAssembly linear memory within a Python script and allow the routine (mainly unchanged) to act on that shimmed memory instead.
+
+Using this method, all I had to do was make a few syntactic changes to the disassembled C code and replace the WebAssembly memory loading and storing instructions with reads and writes to my shimmed memory object (which was just a Python list of integers). The resultant reversal of this encryption was a simple command-line Python application, found in the [`crypt1_reversed.py`](./crypt1_reversed.py) file in this repository.
 
 ## Talking with the C2 Server
 
-Great. So now that we can talk freely with the C2 server, the flag should be just around the corner (ha!).
+Great. So now that we can talk freely with the C2 server, the flag should be just around the corner (ha!). There are a few commands that a miner can send the C2 server. First, there is the aforementioned `hello`, which simply gets another `hello` response. The miner can also send its results to the C2 server via a `mine_found <hash> <hash>`-style command. The C2 server will then respond with a directive to mine the next block. Some experimentation showed that pretty much any two random arguments are accepted for this command without changing the style of responses from the server, so this did not appear to be a valid attack vector. Because no session information was tracked between the miner and the C2 server, I could rule out the possibility of having to mine a certain number of blocks to trigger a reward from the server.
 
-TODO
+The `get_cmd` command, on the other hand, soon attracted my attention. The way this command works is by supplying a deployment key as an argument in order to get instruction from the C2 server on what to do. Here is an example of the intended operation, which tells a miner to start mining.
+
+![get command typical operation](./img/sqli/get_cmd_deploy_key.png "get command typical operation")
+
+I was able to observe that sending an invalid deployment key generates a `no_command` response (as shown below). This indicates that some type of lookup is being performed. If there's a database behind that lookup, this could be the way in.
+
+![get command garbage](./img/sqli/get_cmd_garbage.png "get command garbage")
+
+The first indication of this input being injectable came from the sending a single `'` as the `get_cmd` argument. We should expect to get a normal `no_command` response. As shown below, though, we get a big lead instead.
+
+![first signs of injection](./img/sqli/first_signs.png "first signs of injection")
+
+Toying around with this, I was able to build my first proof-of-concept SQL injection exploit for the C2 server. Of note is that *no spaces* are permited in the payload, as demonstrated below.
+
+![sqli proof of concept](./img/sqli/removing_spaces.png "sqli proof of concept")
+
+This lack of spaces was only a minor obstacle, though, as I could just inject `/*_*/`-style comments wherever a space was needed. I extended my initial proof-of-concept to perform a `union select`-style enumeration of keys in the table. The first few responses were `cmd_mine` (indicating that I was indeed reading valid entries in the table), until I hit something interesting:
+
+![sqli something interesting](./img/sqli/first_different_command.png "sqli something interesting")
+
+It's nice to see the organizers have a sense of humor. This command is using the `run <js code>` directive implemented within the miner to run the JavaScript `console.log` snippet within a miner's runtime. Knowing I was on the right track, I continued my key enumeration until I hit something *very* interesting at key `8`:
+
+![sqli something very interesting](./img/sqli/something_interesting.png "sqli something very interesting")
+
+Since this message was big and I knew that I had done a pretty quick job of reversing `crypt1`, I was fairly confident that my decryption was just failing to decode another (but longer) JavaScript snippet. Fortunately, I could use the previously-mentioned string overwrite at address `5620` in wasm memory to send this SQL injection statement and decrypt it within the wasm's reference implementation of `crypt1`. The overwrite of this address with the vulnerable SQL statement (via the Chrome debugger) is shown in the below screenshot. Note that this makes use of Emscripten's `stringToAscii` function.
+
+![sqli chrome overwrite](./img/sqli/chrome_sql_injection_overwrite.png "sqli chrome overwrite")
+
+By setting another breakpoint on `_run_javascript`, I could extract the decrypted JavaScript snippet from memory, as shown below.
+
+![reward payload in memory](./img/javascript/reward_payload_in_memory.png "reward payload in memory")
 
 ## JavaScript De-obfuscation
 
