@@ -32,14 +32,14 @@ Fortunately, there are some great tools that exist to do such analysis. The one 
 
 After some poking around the C source, I felt like I had a better understanding of the important functions and where I should focus the efforts of my dynamic analysis in the Chrome debugger. Here are some of the key routines found in the binary:
 
-* `_main` - The main entrypoint for execution flow.
-* `_sha256_init` / `_sha256_transform` / `_sha256_init` - Core hashing functionality for the block mining.
-* `_build_key` - A routine called only at the very beginning of program execution.
-* `_do_crypt1` / `_crypt1` / `_crypt1_ks` - Functions related to some type of encryption / decryption. Of note is that this `crypt1` is the only layer of encryption applied to all received *and* sent messages. 
-* `_unxor_script` - A routine which un-xors some portions of the wasm binary, meaning that there are probably some JavaScript snippets embedded within the binary.
-* `_parse_command` - Essentially a big switch statement that parsed received messages from the C2 server. The 
-* `_mine` / `_command_mine` - Routines for parsing of mining directives from the C2 server and discovering blocks.
-* `_ask_for_work` - What the miner initially sends the C2 server to get a block to mine.
+* `_main` - the main entrypoint for execution flow
+* `_sha256_init` / `_sha256_transform` / `_sha256_init` - core hashing functionality for the block mining
+* `_build_key` - a routine called only at the very beginning of program execution
+* `_do_crypt1` / `_crypt1` / `_crypt1_ks` - functions related to some type of encryption / decryption (applied to all received *and* sent messages)
+* `_unxor_script` - a routine which un-xors some portions of the wasm binary, meaning that there are probably some JavaScript snippets embedded within the binary
+* `_parse_command` - essentially a big switch statement that parsed received messages from the C2 server
+* `_mine` / `_command_mine` - routines for parsing of mining directives from the C2 server and discovering blocks
+* `_ask_for_work` - kick things off to get the first command from the C2 server
 
 There are also three important functions implemented via JavaScript in `miner.js`: `_run_javascript`, `_save_block`, and `_send_packet`. These all do just what their names indicate. I was most intrigued by `_run_javascript`, as this paired with the `run <text>` command checked for in the `_parse_command` routine allows the C2 server to send and execute arbitrary JavaScript on a miner. Interestingly, these exported JavaScript snippets can also be extracted from the wasm binary's data segment, as shown below.
 
