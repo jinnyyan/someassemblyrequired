@@ -67,7 +67,7 @@ Further examination of the call stack during other chains of events in the progr
 
 ![mine callstack](./img/crypt1/mine_callstack.png "mine callstack")
 
-Working backwards from the first `hello` message being sent over the wire, I could know understand how the encryption key was generated. First, two JavaScript snippets are extracted from the wasm binary by un-xoring their contents. These scripts write two pieces of information to memory, which are concatenated to form the "first-level" key. The first snippet pulls the port number from the URL:
+Working backwards from the first `hello` message being sent over the wire, I could now understand how the encryption key was generated. First, two JavaScript snippets are extracted from the wasm binary by un-xoring their contents. These scripts write two pieces of information to memory, which are concatenated to form the "first-level" key. The first snippet pulls the port number from the URL:
 
 ```javascript
 let pointerize=(s)=>{let b=Module._malloc(s.length+1);Module.writeAsciiToMemory(s,b);return b};return pointerize(location.port);
