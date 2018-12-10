@@ -26,15 +26,74 @@ So what was this WebAssembly payload actually doing to my poor laptop fan? For s
 
 ![IndexedDB tables](./img/crypt1/indexeddb.png "IndexedDB tables")
 
-As shown in the screenshot, this table was periodically filling up with data. My next step was to perform some static analysis on the WebAssembly binary on the server to get a better understanding of the bulk of the payload.
+As shown in the screenshot, this table was periodically filling up with data. The reference to blocks and rewards (in addition to one of the files being dubbed `miner.js`) gave me a feeling that I was likely dealing with some type of cryptocurrency-mining payload. My next step was to perform some static analysis on the WebAssembly binary to get a better understanding of the bulk of the payload. Fortunately, there are some great tools that exist to do such analysis. The one I went with was [WABT - The WebAssembly Binary Toolkit](https://github.com/WebAssembly/wabt). This collection of tools allows you to translate wasm binaries to C source code, which makes some of the analysis much easier.
 
-TODO
+After some poking around the C source, I felt like I had a better understanding of the important functions and where I should focus the efforts of my dynamic analysis in the Chrome debugger. Here are some of the key routines found in the binary:
+
+* `_main` - The main entrypoint for execution flow.
+* `_sha256_init` / `_sha256_transform` / `_sha256_init` - Core hashing functionality for the block mining.
+* `_build_key` - A routine called only at the very beginning of program execution.
+* `_do_crypt1` / `_crypt1` / `_crypt1_ks` - Functions related to some type of encryption / decryption. Of note is that this `crypt1` is the only layer of encryption applied to all received *and* sent messages. 
+* `_unxor_script` - A routine which un-xors some portions of the wasm binary, meaning that there are probably some JavaScript snippets embedded within the binary.
+* `_parse_command` - Essentially a big switch statement that parsed received messages from the C2 server. The 
+* `_mine` / `_command_mine` - Routines for parsing of mining directives from the C2 server and discovering blocks.
+* `_ask_for_work` - What the miner initially sends the C2 server to get a block to mine.
+
+There are also three important functions implemented via JavaScript in `miner.js`: `_run_javascript`, `_save_block`, and `_send_packet`. These all do just what their names indicate. I was most intrigued by `_run_javascript`, as this paired with the `run <text>` command checked for in the `_parse_command` routine allows the C2 server to send and execute arbitrary JavaScript on a miner. Interestingly, these exported JavaScript snippets can also be extracted from the wasm binary's data segment, as shown below.
+
+![js snippets from wasm binary](./img/crypt1/strings_mem.png "js snippets from wasm binary")
+
+Finally, I also noticed a `_tcrypt` function was exported from the wasm binary (allowing it to be called from JavaScript code) but was never called anywhere within either the wasm binary or the `miner.js` script. I decided to hold off on exploring this for the time being to focus on `crypt1`, but know that it will become an important piece later on.
 
 ## Reversing `crypt1`
 
-Knowing that the mining client was both sending and receiving some type of encrypted / obfuscated payload to and from the C2 server, the first obvious step appeared to be reversing this communication stream. This would allow us to communicate directly with the server to both gather more information as well as poke around for vulnerabilities.
+Knowing that the mining client was both sending and receiving some type of encrypted / obfuscated payload to and from the C2 server, the first obvious step appeared to be reversing this communication stream. This would allow me to communicate directly with the server to both gather more information as well as poke around for vulnerabilities. There appeared to be a few steps involved in this encryption process:
 
-TODO
+* Load an initial key within the `_build_key` routine
+* Further obfuscate this key via the `_crypt1_ks` routine
+* Run the actual encryption routine using this obfuscated key, done in the `_crypt1` routine
+
+I was able to determine this chain events from some analysis of the first message that the miner sends to the C2 server which, when decrypted, is the plaintext string `hello`. This ended up being something very important to find, as the address in memory of the `hello` string was statically defined to `5620`, meaning that I knew the memory location of a string that would always be sent to the C2 server on program startup. This meant that I could pause execution, overwrite this address with a string of my choosing, and resume execution to send any encrypted message I wanted to the C2 server. While I could have used this mechanism to completely bypass the reversal of `crypt1`, it was a fairly timely process. If I was going to be searching for vulnerabilities in the C2 server, I would need something quick and dirty like a Python script (which would require actually reversing the encryption). However, this overwrite at memory location `5620` will be an important piece later on. This is will be an important piece later on. The encrypted `hello` message being sent is shown in the below screenshot on Chrome's networking tools.
+
+![encrypted hello message](./img/crypt1/network_send_encrypted_hello.png "encrypted hello message")
+
+Further examination of the call stack during other chains of events in the program's execution confirmed that `_crypt1` is the driver behind all encryption and decryption of communication with the C2 server. An example of the call stack for the block-mining flow of function calls is shown towards the right of the below screenshot.
+
+![mine callstack](./img/crypt1/mine_callstack.png "mine callstack")
+
+Working backwards from the first `hello` message being sent over the wire, I could know understand how the encryption key was generated. First, two JavaScript snippets are extracted from the wasm binary by un-xoring their contents. These scripts write two pieces of information to memory, which are concatenated to form this first-level key. The first snippet pulls the port number from the URL:
+
+```javascript
+let pointerize=(s)=>{let b=Module._malloc(s.length+1);Module.writeAsciiToMemory(s,b);return b};return pointerize(location.port);
+```
+
+The second snippet uses the `deploy_key` variable defined within `worker.js`:
+
+```javascript
+let pointerize=(s)=>{let b=Module._malloc(s.length+1);Module.writeAsciiToMemory(s,b);return b};return pointerize(deploy_key);
+```
+
+These snippets could be pulled from memory by setting a breakpoint within the `_run_javascript` function, as shown below.
+
+![run javascript breakpoint](./img/crypt1/build_key_js.png "run javascript breakpoint")
+
+So, our first-level key is `75182d613b486cbb9a01c37498676f325759`. Unfortunately, there is yet another step to be performed before this key can be used to encrypt / decrypt messages. This next step comes in the form of the `_crypt1_ks` routine. While I never bothered to fully understand the internals of this routine, I was able to gather that it essentially extends our first-level key to a lenght of 256 bytes and leaves it memory to be used by the core `_crypt1` routine later on. In the below screenshot, I've highlighted the indication of the 256-byte length as well as the first argument, which is where the resulting second-level key will be written to in memory.
+
+![second-level key debugging](./img/crypt1/ks_key.png "second-level key debugging")
+
+Now with that part figured out, I could determine what arguments are passed to `_crypt1`. Below is an example from stepping through the encryption of `hello`.
+
+![crypt1 arguments](./img/crypt1/debugging_args.png "crypt1 arguments")
+
+The first argument, as we just touched on, is the starting location in memory of the 256-byte second-level key. The second argument is the starting address of the plaintext to be encrypted (remember that `hello` is statically defined at memory location `5620`). The third argument is the starting address of where the resultant encrypted message will be written to. The final and fourth argument is the length of the message. Of note is that encrypted and plaintext messages were always the same length, which makes verification a little bit easier. We can confirm that the `crypt1` function is acting on the plaintext `hello` as we expected by inspecting the memory locations in the debugger. I've highlighted `hello` in memory in the below screenshot. 
+
+![finding hello in memory](./img/crypt1/debugging_hello_in_mem.png "finding hello in memory")
+
+Of note is that I was able to pull the full 256-byte second-level from memory. Because this is based on the static port number and deploy key, it is always the same and can be used in my reversal of the encryption logic. I now had enough information to try my hand at reversing the core `_crypt1` routine. The first step  was to examine its C source (some of which is shown below). 
+
+![crypt1 C code](./img/crypt1/c_code.png "crypt1 C code")
+
+So, all of the parameters and local variables are not helpfully named. I realized that reversing this by translating its logic by hand was probably beyond my ability to do in a timely fashion, so I turned to alternative methods. I realized that since I knew that `_crypt1` was a pure function (i.e., its output relies solely on the parameters passed to it and not on any other system state), I could "cheat" a little bit by shimming the WebAssembly linear memory within a Python script and allow the routine (mainly unchanged) to act on that shimmed memory instead. Using this method, all I had to do was make a few syntactic changes to the disassembled C code and replace the WebAssembly memory loading and storing instructions with reads and writes to my shimmed memory object (which was just a Python list of integers). The resultant reversal of this encryption was a simple command-line Python application, found in the [`crypt1_reversed.py`](./crypt1_reversed.py) file in this repository.
 
 ## Talking with the C2 Server
 
